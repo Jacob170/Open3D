@@ -1,4 +1,7 @@
 *.whl
+.venv/
+data/
+telemetry.csv
 
 # Docker build artifacts (wheel, dev package, ccache)
 docker/*.tar.gz
