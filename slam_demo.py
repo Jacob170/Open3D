@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import bisect
 import csv
+import json
 import math
 import queue
 import threading
@@ -24,13 +25,15 @@ import open3d as o3d
 import yaml
 from scipy.spatial.transform import Rotation
 
+from autonomous_loop import LoopResult, detect_loop, make_keyframe
+
 
 @dataclass(frozen=True)
 class FrameRecord:
     timestamp: float
     color: Path
     depth: Path
-    gt_pose: np.ndarray
+    gt_pose: np.ndarray | None
 
 
 @dataclass
@@ -40,8 +43,8 @@ class FrameState:
     estimated: np.ndarray
     local_odometry: np.ndarray
     corrected: np.ndarray
-    optimized_path: np.ndarray
-    ground_truth: np.ndarray
+    optimized_poses: np.ndarray
+    ground_truth: np.ndarray | None
     covariance: np.ndarray
     map_points: np.ndarray
     map_colors: np.ndarray
@@ -52,6 +55,14 @@ class FrameState:
     timings_ms: dict[str, float]
     odometry_ok: bool
     closure: bool
+    loop_source: int | None
+    loop_compared: int
+    loop_appearance_candidates: int
+    loop_geometric_checks: int
+    loop_matches: int
+    pnp_inliers: int
+    icp_fitness: float
+    icp_rmse: float
     correction_jump_m: float
     produced_at: float
 
@@ -86,26 +97,36 @@ def pose_from_tum(values: list[str]) -> np.ndarray:
 
 
 def load_records(dataset: Path, max_dt: float) -> list[FrameRecord]:
-    """Associate RGB, depth, and ground truth by nearest timestamp."""
+    """Associate RGB/depth and optionally attach nearest ground-truth poses."""
     rgb = read_tum_list(dataset / "rgb.txt", 2)
     depth = read_tum_list(dataset / "depth.txt", 2)
-    ground_truth = read_tum_list(dataset / "groundtruth.txt", 8)
+    ground_truth_path = dataset / "groundtruth.txt"
+    ground_truth = (read_tum_list(ground_truth_path, 8)
+                    if ground_truth_path.exists() else [])
     records: list[FrameRecord] = []
     for stamp, color_fields in rgb:
         depth_row = nearest(depth, stamp)
-        gt_row = nearest(ground_truth, stamp)
-        if abs(depth_row[0] - stamp) > max_dt or abs(gt_row[0] - stamp) > max_dt:
+        if abs(depth_row[0] - stamp) > max_dt:
             continue
+        gt_pose = None
+        if ground_truth:
+            gt_row = nearest(ground_truth, stamp)
+            if abs(gt_row[0] - stamp) <= max_dt:
+                gt_pose = pose_from_tum(gt_row[1])
         records.append(FrameRecord(stamp, dataset / color_fields[0],
-                                   dataset / depth_row[1][0],
-                                   pose_from_tum(gt_row[1])))
+                                   dataset / depth_row[1][0], gt_pose))
     if not records:
         raise RuntimeError(f"No associated frames found under {dataset}")
 
-    # Use frame zero as the fixed map origin, matching odometry initialization.
-    origin_inverse = np.linalg.inv(records[0].gt_pose)
+    # GT is evaluation-only outside gt-assisted mode; normalize it when available.
+    origin = next((record.gt_pose for record in records
+                   if record.gt_pose is not None), None)
+    if origin is None:
+        return records
+    origin_inverse = np.linalg.inv(origin)
     return [FrameRecord(r.timestamp, r.color, r.depth,
-                        origin_inverse @ r.gt_pose) for r in records]
+                        origin_inverse @ r.gt_pose if r.gt_pose is not None else None)
+            for r in records]
 
 
 def make_intrinsic(config: dict) -> o3d.camera.PinholeCameraIntrinsic:
@@ -182,10 +203,11 @@ def optimize_pose_graph(pose_graph, config):
 
 
 def processing_loop(records, config, output, stop, pause, seed):
-    """Run RGB-D odometry in a worker and publish immutable viewer updates."""
+    """Run odometry, optional autonomous/GT graph correction, and mapping."""
     try:
         rng = np.random.default_rng(seed)
         intrinsic = make_intrinsic(config)
+        mode = config["slam"]["mode"]
         option = o3d.pipelines.odometry.OdometryOption()
         option.depth_diff_max = config["processing"]["depth_diff_max_m"]
         jacobian = o3d.pipelines.odometry.RGBDOdometryJacobianFromHybridTerm()
@@ -195,12 +217,16 @@ def processing_loop(records, config, output, stop, pause, seed):
         pose_graph = o3d.pipelines.registration.PoseGraph()
         pose_graph.nodes.append(o3d.pipelines.registration.PoseGraphNode(np.eye(4)))
         keyframes: list[tuple[int, np.ndarray, np.ndarray]] = []
+        loop_database = []
+        last_loop_frame = -config["autonomous_loop"]["cooldown_frames"]
         covariance = initial_covariance(config)
         process_covariance = process_noise(config)
         previous = read_rgbd(records[0], config)
         fieldnames = ["frame", "timestamp", "io_ms", "odometry_ms", "map_ms",
                       "total_ms", "processing_hz", "odometry_ok", "closure",
-                      "correction_jump_m", "position_std_m"]
+                      "loop_source", "loop_compared", "loop_appearance_candidates",
+                      "loop_geometric_checks", "loop_matches", "pnp_inliers",
+                      "icp_fitness", "icp_rmse", "correction_jump_m", "position_std_m"]
 
         telemetry_path = Path(__file__).parent / "telemetry.csv"
         with telemetry_path.open("w", newline="", encoding="utf-8") as csv_file:
@@ -237,12 +263,24 @@ def processing_loop(records, config, output, stop, pause, seed):
                         index - 1, index, source_to_target, information, uncertain=False))
                     covariance = covariance + process_covariance
 
-                closure_period = config["processing"]["loop_closure_every_n_frames"]
-                closure = index > 0 and closure_period > 0 and index % closure_period == 0
+                stage = time.perf_counter()
+                local_points, local_colors = point_chunk(current, intrinsic, config, rng)
+                is_keyframe = index % config["processing"]["map_every_n_frames"] == 0
+                loop_result: LoopResult | None = None
+                closure = False
                 jump = 0.0
-                if closure:
+                loop_source = None
+                loop_compared = 0
+                loop_appearance_candidates = 0
+                loop_geometric_checks = 0
+
+                closure_period = config["processing"]["loop_closure_every_n_frames"]
+                gt_constraint = (mode == "gt-assisted" and index > 0 and
+                                 closure_period > 0 and index % closure_period == 0)
+                if gt_constraint:
+                    if record.gt_pose is None or records[0].gt_pose is None:
+                        raise RuntimeError("GT-assisted mode requires associated ground truth")
                     before = corrected[:3, 3].copy()
-                    # A high-confidence synthetic loop edge stands in for place recognition.
                     loop_transform = np.linalg.inv(record.gt_pose) @ records[0].gt_pose
                     loop_information = np.eye(6) * config["optimization"]["loop_information"]
                     pose_graph.edges.append(o3d.pipelines.registration.PoseGraphEdge(
@@ -250,12 +288,39 @@ def processing_loop(records, config, output, stop, pause, seed):
                     optimize_pose_graph(pose_graph, config)
                     corrected = np.asarray(pose_graph.nodes[-1].pose).copy()
                     jump = float(np.linalg.norm(corrected[:3, 3] - before))
+                    closure, loop_source = True, 0
                     covariance *= config["covariance"]["loop_closure_shrink"]
 
-                stage = time.perf_counter()
-                local_points, local_colors = point_chunk(current, intrinsic, config, rng)
+                current_loop_keyframe = None
+                if mode == "autonomous" and is_keyframe:
+                    current_loop_keyframe = make_keyframe(
+                        index, np.asarray(current.color), np.asarray(current.depth),
+                        local_points, config["camera"], config["autonomous_loop"])
+                    loop_result, search_stats = detect_loop(
+                        current_loop_keyframe, loop_database, config["camera"],
+                        config["autonomous_loop"], last_loop_frame)
+                    loop_compared = search_stats.compared
+                    loop_appearance_candidates = search_stats.appearance_candidates
+                    loop_geometric_checks = search_stats.geometric_checks
+                    if loop_result is not None:
+                        before = corrected[:3, 3].copy()
+                        pose_graph.edges.append(o3d.pipelines.registration.PoseGraphEdge(
+                            loop_result.source_id, index, loop_result.transformation,
+                            loop_result.information, uncertain=True))
+                        optimize_pose_graph(pose_graph, config)
+                        corrected = np.asarray(pose_graph.nodes[-1].pose).copy()
+                        jump = float(np.linalg.norm(corrected[:3, 3] - before))
+                        closure, loop_source = True, loop_result.source_id
+                        last_loop_frame = index
+                        covariance *= config["covariance"]["loop_closure_shrink"]
+                        print(f"\nAUTONOMOUS LOOP {loop_result.source_id}->{index} | "
+                              f"matches {loop_result.matches} | "
+                              f"PnP {loop_result.pnp_inliers} | "
+                              f"ICP fitness {loop_result.icp_fitness:.3f} | "
+                              f"RMSE {loop_result.icp_rmse:.3f} m", flush=True)
+                    loop_database.append(current_loop_keyframe)
+
                 current_scan = transform_points(local_points, corrected)
-                is_keyframe = index % config["processing"]["map_every_n_frames"] == 0
                 if is_keyframe:
                     keyframes.append((index, local_points, local_colors))
                 if closure:
@@ -277,16 +342,36 @@ def processing_loop(records, config, output, stop, pause, seed):
                     "odometry_ms": f"{odometry_ms:.2f}", "map_ms": f"{map_ms:.2f}",
                     "total_ms": f"{total_ms:.2f}", "processing_hz": f"{timings['hz']:.2f}",
                     "odometry_ok": int(odometry_ok), "closure": int(closure),
+                    "loop_source": "" if loop_source is None else loop_source,
+                    "loop_compared": loop_compared,
+                    "loop_appearance_candidates": loop_appearance_candidates,
+                    "loop_geometric_checks": loop_geometric_checks,
+                    "loop_matches": 0 if loop_result is None else loop_result.matches,
+                    "pnp_inliers": 0 if loop_result is None else loop_result.pnp_inliers,
+                    "icp_fitness": "" if loop_result is None else f"{loop_result.icp_fitness:.4f}",
+                    "icp_rmse": "" if loop_result is None else f"{loop_result.icp_rmse:.4f}",
                     "correction_jump_m": f"{jump:.4f}", "position_std_m": f"{position_std:.4f}"})
                 csv_file.flush()
-                optimized_path = np.asarray([node.pose[:3, 3] for node in pose_graph.nodes])
-                state = FrameState(index, record.timestamp, estimated.copy(),
-                                   local_odometry.copy(), corrected.copy(), optimized_path,
-                                   record.gt_pose.copy(), covariance.copy(), points, colors,
-                                   closure, current_scan,
-                                   np.asarray(current.color).copy(),
-                                   np.asarray(current.depth).copy(), timings, odometry_ok,
-                                   closure, jump, time.perf_counter())
+                optimized_poses = np.asarray([node.pose for node in pose_graph.nodes])
+                ground_truth = (record.gt_pose.copy()
+                                if record.gt_pose is not None else None)
+                state = FrameState(
+                    index=index, timestamp=record.timestamp, estimated=estimated.copy(),
+                    local_odometry=local_odometry.copy(), corrected=corrected.copy(),
+                    optimized_poses=optimized_poses, ground_truth=ground_truth,
+                    covariance=covariance.copy(), map_points=points, map_colors=colors,
+                    replace_map=closure, current_scan=current_scan,
+                    color_frame=np.asarray(current.color).copy(),
+                    depth_frame=np.asarray(current.depth).copy(), timings_ms=timings,
+                    odometry_ok=odometry_ok, closure=closure, loop_source=loop_source,
+                    loop_compared=loop_compared,
+                    loop_appearance_candidates=loop_appearance_candidates,
+                    loop_geometric_checks=loop_geometric_checks,
+                    loop_matches=0 if loop_result is None else loop_result.matches,
+                    pnp_inliers=0 if loop_result is None else loop_result.pnp_inliers,
+                    icp_fitness=0.0 if loop_result is None else loop_result.icp_fitness,
+                    icp_rmse=0.0 if loop_result is None else loop_result.icp_rmse,
+                    correction_jump_m=jump, produced_at=time.perf_counter())
                 while not stop.is_set():
                     try:
                         output.put(state, timeout=0.1)
@@ -294,6 +379,11 @@ def processing_loop(records, config, output, stop, pause, seed):
                     except queue.Full:
                         continue
                 previous = current
+        pose_graph_path = Path(config["_output_dir"]) / config["output"]["pose_graph_file"]
+        pose_graph_path.unlink(missing_ok=True)
+        o3d.io.write_pose_graph(str(pose_graph_path), pose_graph)
+        if not pose_graph_path.is_file():
+            raise RuntimeError(f"Could not save pose graph: {pose_graph_path}")
     except Exception as error:  # Propagate worker failures to the main thread.
         output.put(error)
     finally:
@@ -390,8 +480,213 @@ def make_image_panel(state, config, paused=False):
     return panel
 
 
+def save_outputs(map_points, map_colors, trajectories, config):
+    """Persist the final displayed map and trajectory arrays for later use."""
+    output_dir = Path(config["_output_dir"])
+    output_dir.mkdir(parents=True, exist_ok=True)
+    map_summary = {"saved_points": 0, "extent_m": [0.0, 0.0, 0.0]}
+    if len(map_points):
+        cloud = o3d.geometry.PointCloud()
+        cloud.points = o3d.utility.Vector3dVector(map_points)
+        cloud.colors = o3d.utility.Vector3dVector(map_colors)
+        voxel_size = config["output"]["map_voxel_size_m"]
+        if voxel_size > 0:
+            cloud = cloud.voxel_down_sample(voxel_size)
+        map_path = output_dir / config["output"]["map_file"]
+        if not o3d.io.write_point_cloud(str(map_path), cloud, compressed=True):
+            raise RuntimeError(f"Could not save map: {map_path}")
+        print(f"Saved map: {map_path} ({len(cloud.points)} points)")
+        saved_points = np.asarray(cloud.points)
+        map_summary = {
+            "saved_points": len(saved_points),
+            "extent_m": np.ptp(saved_points, axis=0).round(6).tolist(),
+        }
+
+    trajectory_path = output_dir / config["output"]["trajectory_file"]
+    np.savez_compressed(
+        trajectory_path,
+        noisy=np.asarray(trajectories["estimated"]),
+        local_odometry=np.asarray(trajectories["local_odometry"]),
+        optimized=np.asarray(trajectories["corrected"]),
+        ground_truth=np.asarray(trajectories["ground_truth"]))
+    print(f"Saved trajectories: {trajectory_path}")
+    return map_summary
+
+
+def path_length(poses):
+    """Return translation accumulated along a camera-pose sequence."""
+    if len(poses) < 2:
+        return 0.0
+    positions = np.asarray(poses)[:, :3, 3]
+    return float(np.linalg.norm(np.diff(positions, axis=0), axis=1).sum())
+
+
+def accuracy_kpis(poses, ground_truth):
+    """Compute absolute and relative pose errors on GT-associated frames."""
+    indices = [index for index in sorted(ground_truth) if index < len(poses)]
+    if not indices:
+        return None
+    absolute = [np.linalg.norm(poses[index][:3, 3] - ground_truth[index][:3, 3])
+                for index in indices]
+    relative_translation = []
+    relative_rotation = []
+    for first, second in zip(indices, indices[1:]):
+        estimated_delta = np.linalg.inv(poses[first]) @ poses[second]
+        truth_delta = np.linalg.inv(ground_truth[first]) @ ground_truth[second]
+        error = np.linalg.inv(truth_delta) @ estimated_delta
+        relative_translation.append(np.linalg.norm(error[:3, 3]))
+        relative_rotation.append(math.degrees(Rotation.from_matrix(error[:3, :3]).magnitude()))
+
+    def rmse(values):
+        return float(np.sqrt(np.mean(np.square(values)))) if values else None
+
+    return {
+        "associated_frames": len(indices),
+        "ate_rmse_m": rmse(absolute),
+        "ate_median_m": float(np.median(absolute)),
+        "ate_max_m": float(np.max(absolute)),
+        "rpe_translation_rmse_m": rmse(relative_translation),
+        "rpe_rotation_rmse_deg": rmse(relative_rotation),
+        "final_position_error_m": float(absolute[-1]),
+    }
+
+
+def build_run_summary(samples, optimized_poses, ground_truth, map_summary,
+                      elapsed_s, config):
+    """Build the machine-readable KPI report from final graph and run samples."""
+    timings = {name: np.asarray([sample["timings"][name] for sample in samples])
+               for name in ("io", "odometry", "map", "total")}
+    transitions = samples[1:]
+    successful = sum(sample["odometry_ok"] for sample in transitions)
+    closures = [sample for sample in samples if sample["closure"]]
+    autonomous_closures = [sample for sample in closures if sample["loop_matches"] > 0]
+    geometric_checks = sum(sample["loop_geometric_checks"] for sample in samples)
+    local_poses = np.asarray([sample["local_pose"] for sample in samples])
+
+    def latency(values):
+        return {
+            "mean_ms": float(np.mean(values)),
+            "median_ms": float(np.median(values)),
+            "p95_ms": float(np.percentile(values, 95)),
+        }
+
+    summary = {
+        "run": {
+            "mode": config["slam"]["mode"],
+            "frames_processed": len(samples),
+            "elapsed_s": float(elapsed_s),
+            "ground_truth_available": bool(ground_truth),
+        },
+        "tracking": {
+            "transitions_attempted": len(transitions),
+            "successful_transitions": successful,
+            "success_rate_percent": (100.0 * successful / len(transitions)
+                                     if transitions else 100.0),
+        },
+        "performance": {
+            "effective_throughput_hz": len(samples) / max(elapsed_s, 1e-9),
+            "compute_throughput_hz": 1000.0 / max(float(np.mean(timings["total"])), 1e-9),
+            "latency": {name: latency(values) for name, values in timings.items()},
+        },
+        "loop_closure": {
+            "accepted": len(closures),
+            "database_comparisons": sum(sample["loop_compared"] for sample in samples),
+            "appearance_candidates": sum(
+                sample["loop_appearance_candidates"] for sample in samples),
+            "geometric_checks": geometric_checks,
+            "autonomous_acceptance_rate_percent": (
+                100.0 * len(autonomous_closures) / geometric_checks
+                if geometric_checks else None),
+            "mean_matches": (float(np.mean([sample["loop_matches"]
+                                             for sample in autonomous_closures]))
+                             if autonomous_closures else None),
+            "mean_pnp_inliers": (float(np.mean([sample["pnp_inliers"]
+                                                 for sample in autonomous_closures]))
+                                 if autonomous_closures else None),
+            "mean_pnp_inlier_ratio": (float(np.mean([
+                sample["pnp_inliers"] / sample["loop_matches"]
+                for sample in autonomous_closures]))
+                                      if autonomous_closures else None),
+            "mean_icp_fitness": (float(np.mean([sample["icp_fitness"]
+                                                 for sample in autonomous_closures]))
+                                 if autonomous_closures else None),
+            "mean_icp_rmse_m": (float(np.mean([sample["icp_rmse"]
+                                                for sample in autonomous_closures]))
+                                if autonomous_closures else None),
+            "mean_correction_m": (float(np.mean([sample["correction_jump_m"]
+                                                  for sample in closures]))
+                                  if closures else 0.0),
+            "max_correction_m": (max(sample["correction_jump_m"] for sample in closures)
+                                 if closures else 0.0),
+        },
+        "trajectory": {
+            "local_path_length_m": path_length(local_poses),
+            "optimized_path_length_m": path_length(optimized_poses),
+        },
+        "map": map_summary,
+    }
+    if ground_truth:
+        summary["accuracy"] = {
+            "local_odometry": accuracy_kpis(local_poses, ground_truth),
+            "optimized": accuracy_kpis(optimized_poses, ground_truth),
+        }
+    return summary
+
+
+def print_and_save_summary(summary, config):
+    """Print the high-value KPIs and persist the complete report as JSON."""
+    def metric(value, precision):
+        return "n/a" if value is None else f"{value:.{precision}f}"
+
+    run = summary["run"]
+    tracking = summary["tracking"]
+    performance = summary["performance"]
+    loops = summary["loop_closure"]
+    trajectory = summary["trajectory"]
+    map_kpis = summary["map"]
+    total_latency = performance["latency"]["total"]
+    print("\n=== Run KPI Summary ===")
+    print(f"Mode / frames / elapsed: {run['mode']} / {run['frames_processed']} / "
+          f"{run['elapsed_s']:.2f} s")
+    print(f"Tracking success: {tracking['successful_transitions']}/"
+          f"{tracking['transitions_attempted']} ({tracking['success_rate_percent']:.1f}%)")
+    print(f"Total latency mean / p95: {total_latency['mean_ms']:.1f} / "
+          f"{total_latency['p95_ms']:.1f} ms | compute throughput "
+          f"{performance['compute_throughput_hz']:.2f} Hz")
+    print(f"Loops accepted / geometric checks / DB comparisons: {loops['accepted']} / "
+          f"{loops['geometric_checks']} / {loops['database_comparisons']}")
+    if loops["mean_icp_fitness"] is not None:
+        print(f"Autonomous acceptance / PnP inlier ratio / ICP fitness / RMSE: "
+              f"{metric(loops['autonomous_acceptance_rate_percent'], 1)}% / "
+              f"{metric(loops['mean_pnp_inlier_ratio'], 3)} / "
+              f"{metric(loops['mean_icp_fitness'], 3)} / "
+              f"{metric(loops['mean_icp_rmse_m'], 4)} m")
+    print(f"Loop correction mean / max: {loops['mean_correction_m']:.4f} / "
+          f"{loops['max_correction_m']:.4f} m")
+    print(f"Path length local / optimized: {trajectory['local_path_length_m']:.3f} / "
+          f"{trajectory['optimized_path_length_m']:.3f} m")
+    print(f"Saved map points / extent XYZ: {map_kpis['saved_points']} / "
+          f"{map_kpis['extent_m']} m")
+    if "accuracy" in summary:
+        for name, metrics in summary["accuracy"].items():
+            print(f"{name.replace('_', ' ').title()} ATE RMSE / RPE trans / RPE rot: "
+                  f"{metric(metrics['ate_rmse_m'], 4)} m / "
+                  f"{metric(metrics['rpe_translation_rmse_m'], 4)} m / "
+                  f"{metric(metrics['rpe_rotation_rmse_deg'], 3)} deg")
+    else:
+        print("GT accuracy: unavailable (no groundtruth.txt; estimation remained autonomous)")
+
+    summary_path = (Path(config["_output_dir"]) /
+                    config["output"].get("run_summary_file", "run_summary.json"))
+    with summary_path.open("w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2)
+        handle.write("\n")
+    print(f"Saved run summary: {summary_path}")
+
+
 def consume(output, stop, pause, config, intrinsic, viewer, show_images, realtime):
     """Consume worker states either headlessly or in Open3D's main-thread GUI."""
+    run_started = time.perf_counter()
     visualizer = None
     map_geometry = o3d.geometry.PointCloud()
     scan_geometry = o3d.geometry.PointCloud()
@@ -399,6 +694,9 @@ def consume(output, stop, pause, config, intrinsic, viewer, show_images, realtim
     map_colors = np.empty((0, 3))
     trajectories = {"estimated": [], "local_odometry": [], "corrected": [],
                     "ground_truth": []}
+    samples = []
+    ground_truth_poses = {}
+    optimized_poses = np.empty((0, 4, 4))
     last_view = time.perf_counter()
     wall_start = None
     view_fitted = False
@@ -445,8 +743,10 @@ def consume(output, stop, pause, config, intrinsic, viewer, show_images, realtim
             "estimated": line_set([np.zeros(3)], [1.0, 0.1, 0.1]),
             "local_odometry": line_set([np.zeros(3)], [1.0, 0.55, 0.0]),
             "corrected": line_set([np.zeros(3)], [0.1, 1.0, 0.1]),
-            "ground_truth": line_set([np.zeros(3)], [0.2, 0.4, 1.0]),
         }
+        if config["_has_ground_truth"]:
+            path_geometries["ground_truth"] = line_set(
+                [np.zeros(3)], [0.2, 0.4, 1.0])
         for geometry in path_geometries.values():
             visualizer.add_geometry(geometry)
         frustum = make_frustum(np.eye(4), intrinsic, size["frustum_scale"])
@@ -502,9 +802,27 @@ def consume(output, stop, pause, config, intrinsic, viewer, show_images, realtim
             target = wall_start + state.index / config["processing"]["playback_hz"]
             time.sleep(max(0.0, target - time.perf_counter()))
 
-        for name in ("estimated", "local_odometry", "ground_truth"):
+        for name in ("estimated", "local_odometry"):
             trajectories[name].append(getattr(state, name)[:3, 3].copy())
-        trajectories["corrected"] = list(state.optimized_path)
+        if state.ground_truth is not None:
+            trajectories["ground_truth"].append(state.ground_truth[:3, 3].copy())
+            ground_truth_poses[state.index] = state.ground_truth.copy()
+        optimized_poses = state.optimized_poses.copy()
+        trajectories["corrected"] = list(optimized_poses[:, :3, 3])
+        samples.append({
+            "timings": state.timings_ms.copy(),
+            "odometry_ok": state.odometry_ok,
+            "closure": state.closure,
+            "loop_compared": state.loop_compared,
+            "loop_appearance_candidates": state.loop_appearance_candidates,
+            "loop_geometric_checks": state.loop_geometric_checks,
+            "loop_matches": state.loop_matches,
+            "pnp_inliers": state.pnp_inliers,
+            "icp_fitness": state.icp_fitness,
+            "icp_rmse": state.icp_rmse,
+            "correction_jump_m": state.correction_jump_m,
+            "local_pose": state.local_odometry.copy(),
+        })
         if state.replace_map:
             map_points, map_colors = state.map_points.copy(), state.map_colors.copy()
         elif len(state.map_points):
@@ -549,6 +867,12 @@ def consume(output, stop, pause, config, intrinsic, viewer, show_images, realtim
         visualizer.destroy_window()
     if show_images:
         cv2.destroyAllWindows()
+    map_summary = save_outputs(map_points, map_colors, trajectories, config)
+    if samples:
+        summary = build_run_summary(
+            samples, optimized_poses, ground_truth_poses, map_summary,
+            time.perf_counter() - run_started, config)
+        print_and_save_summary(summary, config)
 
 
 def main() -> None:
@@ -560,6 +884,8 @@ def main() -> None:
     parser.add_argument("--no-image-window", action="store_true", help="Show 3D only")
     parser.add_argument("--no-realtime", action="store_true", help="Do not pace visualization")
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--mode", choices=("autonomous", "gt-assisted", "odometry-only"),
+                        help="Override slam.mode from config.yaml")
     closure_group = parser.add_mutually_exclusive_group()
     closure_group.add_argument("--no-loop-closure", action="store_true",
                                help="Disable loop constraints/global optimization")
@@ -570,19 +896,33 @@ def main() -> None:
     config_path = args.config.resolve()
     with config_path.open(encoding="utf-8") as handle:
         config = yaml.safe_load(handle)
+    if args.mode:
+        config["slam"]["mode"] = args.mode
     if args.no_loop_closure:
-        config["processing"]["loop_closure_every_n_frames"] = 0
+        config["slam"]["mode"] = "odometry-only"
     elif args.loop_closure_every is not None:
+        config["slam"]["mode"] = "gt-assisted"
         config["processing"]["loop_closure_every_n_frames"] = args.loop_closure_every
+    mode = config["slam"]["mode"]
     dataset = args.dataset.resolve() if args.dataset else (
         config_path.parent / config["dataset"]["path"]).resolve()
-    if not (dataset / "groundtruth.txt").exists():
+    if not (dataset / "rgb.txt").exists() or not (dataset / "depth.txt").exists():
         raise SystemExit(f"Dataset missing: {dataset}\nRun: python download_dataset.py")
     records = load_records(dataset, config["dataset"]["association_max_dt_s"])
+    if mode == "gt-assisted":
+        records = [record for record in records if record.gt_pose is not None]
+        if not records:
+            raise SystemExit("GT-assisted mode requires associated ground-truth poses")
     records = records[::config["processing"]["frame_stride"]]
     maximum = args.max_frames or config["processing"]["max_frames"]
     records = records[:maximum]
-    print(f"Associated {len(records)} frames | fixed map origin = first GT pose")
+    config["_has_ground_truth"] = any(record.gt_pose is not None for record in records)
+    output_dir = config_path.parent / config["output"]["directory"]
+    output_dir.mkdir(parents=True, exist_ok=True)
+    config["_output_dir"] = str(output_dir.resolve())
+    gt_status = "available for display" if config["_has_ground_truth"] else "not present"
+    print(f"Associated {len(records)} frames | mode={mode} | "
+          f"map origin=first camera | GT={gt_status}")
 
     output: queue.Queue = queue.Queue(maxsize=2)
     stop = threading.Event()

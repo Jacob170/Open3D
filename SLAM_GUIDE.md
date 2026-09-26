@@ -1,283 +1,310 @@
 # RGB-D localization and SLAM guide
 
-## 1. What this repository demonstrates
+## 1. What the demo teaches
 
-The demo estimates a camera trajectory and builds a colored point-cloud map from
-the TUM `freiburg1_xyz` RGB-D sequence. It deliberately displays several answers
-to "where is the camera?" at the same time:
+The demo estimates camera motion and builds a colored point-cloud map from a
+synchronized RGB-D sequence. Its default path is autonomous: all estimation and
+loop closure use RGB and depth only. A TUM `groundtruth.txt` file is optional in
+this mode and is used exclusively for the blue reference path and accuracy KPIs.
+
+The display separates several answers to "where is the camera?":
 
 | Color/object | Meaning |
 |---|---|
-| Magenta sphere | Current globally optimized camera center in the fixed map frame |
-| Cyan frustum | Current optimized camera orientation and field of view |
-| Cyan point cloud | Current depth scan transformed into the map at that camera pose |
-| Orange path | Raw local RGB-D odometry; no loop closure or global optimization |
-| Green path | Pose-graph trajectory after loop constraints/global optimization |
-| Red path | Raw odometry plus artificial incremental noise, to make drift obvious |
-| Blue path | TUM motion-capture ground truth; evaluation reference, not an estimate |
-| RGB-colored cloud | Accumulated map, rebuilt after each global correction |
-| Yellow ellipsoid | Three-standard-deviation positional uncertainty around the camera |
-| XYZ axes | Fixed world/map origin: the first ground-truth camera pose |
+| Orange path | Local dense RGB-D odometry, never globally corrected |
+| Green path | Current/final pose-graph trajectory |
+| Red path | Local odometry plus artificial incremental SE(3) noise |
+| Blue path | Optional normalized GT reference, not an autonomous estimate |
+| Cyan cloud | Current depth scan transformed by the corrected pose |
+| RGB cloud | Accumulated keyframe map, rebuilt after graph optimization |
+| Magenta sphere / cyan frustum | Corrected camera position and orientation |
+| Yellow rings | Heuristic positional uncertainty display |
 
-The cyan scan is the clearest localization check. If the pose is good, its walls
-and objects overlap the RGB-colored map. A bad pose makes the cyan scan appear
-doubled or detached from the map.
+The cyan scan is a useful qualitative localization check: aligned surfaces should
+overlap the RGB map. It is not a quantitative accuracy test because the map was
+built from the same estimates.
 
-This is an educational front end around Open3D's existing RGB-D odometry and
-pose-graph optimization. It is not a production SLAM stack and its loop detector
-is intentionally simulated from ground truth.
+This remains an educational implementation. The algorithms are real, but the
+loop database is linear, mapping is point-cloud concatenation, covariance is a
+configured random walk, and the system has no persistent landmarks,
+relocalization, IMU fusion, or production loop manager.
 
-## 2. Run and compare modes
+## 2. Run all three modes
 
 ```bash
 cd /home/jacob/airobotics/3d_slam_example
 source .venv/bin/activate
 
-# Normal: local paths plus a globally corrected path in one view.
+# Default: autonomous RGB-D-only SLAM.
 python slam_demo.py
 
-# No loop closure and no global optimization. Watch orange drift from blue.
-python slam_demo.py --no-loop-closure
+# Equivalent explicit selection.
+python slam_demo.py --mode autonomous
 
-# More frequent global correction for a short experiment.
+# Dense sequential odometry and mapping, no loop optimization.
+python slam_demo.py --mode odometry-only
+
+# Scheduled GT-derived teaching constraints; groundtruth.txt is required.
+python slam_demo.py --mode gt-assisted
+
+# Select gt-assisted and change its interval.
 python slam_demo.py --loop-closure-every 20
 
-# Compute and telemetry only (SSH or benchmarking).
+# Alias for odometry-only.
+python slam_demo.py --no-loop-closure
+
+# Headless and unpaced.
 python slam_demo.py --no-viewer --no-realtime --max-frames 100
 ```
 
-### Viewer controls
+| Mode | What creates global constraints | GT role |
+|---|---|---|
+| `autonomous` | ORB appearance retrieval, depth-backed PnP, ICP verification | Optional evaluation/display only |
+| `gt-assisted` | Periodic node-zero-to-current transform computed from GT | Required estimation input; resulting accuracy is not independent |
+| `odometry-only` | Nothing; graph contains sequential edges only | Optional evaluation/display only |
 
-| Input | Action |
-|---|---|
-| Left mouse drag | Orbit; horizontal movement rotates, vertical movement tilts |
-| `Ctrl` + left mouse drag | Pan/translate the view without rotating |
-| Middle mouse drag | Pan/translate (alternative to `Ctrl` + left drag) |
-| Mouse wheel | Zoom in/out |
-| `R` | Reset the view to fit the map |
-| `H` | Print Open3D's built-in control help in the terminal |
-| `Space` | Pause/resume odometry and playback; map navigation remains active |
-| `Q` in RGB-D window | Quit |
-| `Esc` | Quit |
+Autonomous detection runs only at map keyframes. The scheduled
+`loop_closure_every_n_frames` setting applies only to `gt-assisted` mode.
 
-`Space` works when either the 3D or RGB-D window has keyboard focus. While
-paused, the current frame, camera pose and map are frozen, but the GUI event loop
-continues, so orbit, pan, tilt and zoom still work. `--no-image-window` keeps
-only the 3D viewer.
+## 3. Dataset and association
 
-## 3. Pipeline, step by step
-
-### 3.1 Timestamp association
-
-`load_records()` reads `rgb.txt`, `depth.txt`, and `groundtruth.txt`. For each RGB
-timestamp it chooses the nearest depth and ground-truth timestamps, rejecting a
-match when the difference exceeds `association_max_dt_s`.
-
-All ground-truth poses are normalized by the first pose:
+Only RGB and depth are required:
 
 ```text
-T_map_camera[i] = inverse(T_world_camera[0]) * T_world_camera[i]
+dataset/
+|-- rgb.txt
+|-- depth.txt
+|-- rgb/*.png
+`-- depth/*.png
 ```
 
-The first camera is therefore the fixed map origin.
+Optionally add:
 
-### 3.2 Back-projection into 3D
+```text
+groundtruth.txt   # timestamp tx ty tz qx qy qz qw
+```
 
-For a pixel `(u, v)` with depth `z`, the pinhole model produces a camera-frame
-point:
+For each RGB timestamp, the loader selects the nearest depth timestamp and keeps
+the record when that gap is at most `association_max_dt_s`. If GT exists, the
+nearest pose is attached only when its own gap passes the same tolerance. Missing
+GT association does not discard valid RGB-D in autonomous or odometry-only mode.
+`gt-assisted` later filters out records without GT before applying
+`frame_stride` and `max_frames`.
+
+Depth is converted to meters with `depth_raw / depth_scale` and truncated at
+`depth_trunc_m`. Optional GT poses are normalized by the first associated pose:
+
+```text
+T_map_camera_gt[i] = inverse(T_world_camera_gt[0]) * T_world_camera_gt[i]
+```
+
+This normalization supports comparison; it does not define autonomous motion.
+The estimated graph independently starts with identity at the first camera.
+
+## 4. Pipeline, step by step
+
+### 4.1 Dense frame-to-frame odometry
+
+`processing_loop()` calls Open3D `compute_rgbd_odometry()` with the hybrid
+photometric/geometric Jacobian. It estimates a relative transform from the
+previous camera to the current camera by aligning image intensity and depth. The
+camera-to-map pose is composed using the inverse:
+
+```text
+T_map_current = T_map_previous * inverse(T_current_previous)
+```
+
+This local solver is dense. It does not use the ORB descriptors described below;
+ORB is only for finding long-range loop candidates. Every processed frame gets a
+pose-graph node and a sequential edge. Failed odometry holds the pose and inserts
+an identity edge with weak information so failure remains visible.
+
+### 4.2 Keyframes and ORB ratio-match retrieval
+
+Every `map_every_n_frames` processed frames, the program creates both a map
+keyframe and an autonomous loop keyframe. ORB detects up to `orb_features`
+keypoints. A descriptor is retained only if its rounded image pixel has valid
+metric depth below `max_feature_depth_m`; the pixel is then back-projected:
 
 ```text
 x = (u - cx) * z / fx
 y = (v - cy) * z / fy
-p_camera = [x, y, z, 1]
+object_point = [x, y, z] in the old keyframe camera
 ```
 
-`point_chunk()` calls Open3D's `create_from_rgbd_image()`, voxel-downsamples the
-result, and bounds the number of points. `transform_points()` then localizes that
-scan in the map:
+Eligible old keyframes must be at least `min_frame_separation` processed indices
+away. After a loop acceptance, no database search occurs for `cooldown_frames`.
+For each eligible old/current pair, brute-force Hamming KNN matching obtains two
+neighbors per old descriptor. Lowe's ratio filter keeps a match when:
 
 ```text
-p_map = T_map_camera * p_camera
+best_distance < ratio_test * second_best_distance
 ```
 
-That transformed scan is shown in cyan. Selected scans become map keyframes.
-
-### 3.3 Dense RGB-D odometry
-
-`processing_loop()` calls Open3D `compute_rgbd_odometry()` with
-`RGBDOdometryJacobianFromHybridTerm`. This is a dense direct method, not an ORB,
-SIFT, or feature-keypoint pipeline. It minimizes a combination of:
-
-- Photometric error: corresponding pixels should have similar intensity.
-- Geometric/depth error: transformed depth surfaces should align in 3D.
-
-The result `T_target_source` maps the previous camera frame into the current
-camera frame. The camera-to-map pose is accumulated using its inverse:
+The normalized appearance score is:
 
 ```text
-T_map_camera[i] = T_map_camera[i-1] * inverse(T_target_source)
+good_match_count / max(1, min(old_descriptor_count, current_descriptor_count))
 ```
 
-Each small error is integrated into the next pose, so the orange path drifts.
-The red path receives an additional random SE(3) perturbation from `noise.*`.
+A candidate must pass `min_matches` and `min_match_score`. Candidates are ranked
+by absolute good-match count, not normalized score, and only the strongest
+`max_candidates` proceed to geometry. These choices are simple and transparent,
+not a scalable bag-of-words or learned retrieval system.
 
-### 3.4 Pose graph and loop closure
+### 4.3 Depth-backed `solvePnPRansac`
 
-The graph contains one node per camera pose and two edge types:
+For every ratio match, the old keyframe supplies a depth-backed 3D object point
+and the current keyframe supplies a 2D image observation. OpenCV
+`solvePnPRansac()` with EPNP estimates the transform from the old candidate camera
+to the current camera. It uses configured RANSAC iterations, pixel reprojection
+threshold, and confidence.
 
-- Odometry edge: relative transform and 6x6 information matrix returned by
-  Open3D between consecutive frames.
-- Loop edge: a high-confidence relative-pose constraint from node zero to the
-  current node.
+The proposal is rejected unless it reaches both the absolute
+`min_pnp_inliers` and relative `min_pnp_inlier_ratio`. PnP provides metric scale
+because its object points came from RGB-D depth.
 
-This teaching demo creates the loop edge from TUM ground truth every
-`loop_closure_every_n_frames`. A real system would first perform place
-recognition and then estimate/verify the loop transform using geometry.
+### 4.4 ICP refinement and verification
 
-`optimize_pose_graph()` invokes Open3D's Levenberg-Marquardt global optimizer.
-It moves all graph nodes to jointly reduce odometry and loop-edge residuals while
-holding node zero fixed. The complete green path changes, not only its endpoint.
-The stored keyframe clouds are then transformed again using the optimized poses,
-so the map and trajectory stay in the same coordinate frame.
+Open3D point-to-point ICP aligns the old and current local keyframe clouds using
+the PnP transform as initialization. Acceptance requires adequate fitness, low
+inlier RMSE, and limited translation and rotation change from the PnP proposal:
 
-### 3.5 Pose graph optimization versus bundle adjustment
+```text
+fitness >= min_icp_fitness
+inlier_rmse <= max_icp_rmse_m
+||translation(T_icp * inverse(T_pnp))|| <= max_icp_translation_correction_m
+angle(T_icp * inverse(T_pnp)) <= max_icp_rotation_correction_deg
+```
 
-This demo performs **pose-graph optimization (PGO)**, not classical bundle
-adjustment (BA). Calling it BA would be technically incorrect.
+The final ICP transform and an information matrix computed from the two clouds
+form an uncertain source-keyframe-to-current edge. The first candidate to pass is
+accepted. Match count, PnP inliers, ICP fitness, and ICP RMSE for accepted loops
+are preserved in `telemetry.csv`.
+
+Thresholds reduce, but cannot eliminate, false closures. Repeated geometry,
+texture aliasing, sparse depth at keypoints, and local ICP minima remain risks.
+
+### 4.5 Pose-graph optimization
+
+The graph combines certain sequential odometry edges with uncertain loop edges.
+After an autonomous verified edge or a scheduled GT-assisted edge is inserted,
+Open3D's Levenberg-Marquardt global optimizer adjusts graph nodes while holding
+node zero fixed. Its correspondence scale, uncertain-edge pruning threshold, and
+loop preference come from `optimization.*`.
+
+The entire green trajectory is refreshed after optimization. Cached keyframe
+clouds remain in their camera coordinates, so every cloud can be re-transformed
+by its updated graph-node pose and the map can be rebuilt consistently.
+
+The reported correction jump is the current endpoint's translation displacement
+before versus after optimization. It does not summarize all node movement or
+prove that the accepted edge improved accuracy. The code also does not inspect
+whether Open3D pruned the uncertain edge afterward.
+
+### 4.6 Why this is not bundle adjustment
 
 | Method | Variables | Residuals |
 |---|---|---|
-| PGO used here | Camera poses | Relative SE(3) pose constraints |
-| Classical visual BA | Camera poses and 3D landmarks | 2D feature reprojection errors |
-| Dense RGB-D refinement | Camera poses/surfaces | Photometric and depth alignment errors |
+| Pose graph here | Camera poses | Relative SE(3) constraints |
+| Classical bundle adjustment | Camera poses and persistent landmarks | 2D reprojection errors |
+| Dense RGB-D odometry | One relative pose | Photometric and depth alignment errors |
 
-BA needs persistent feature tracks and landmark observations. Open3D's dense
-RGB-D odometry does not create those landmarks, so there are no keypoints to
-draw. PGO serves the same global-consistency role for this pose-based RGB-D
-example. The orange-versus-green comparison is the requested local-only versus
-globally optimized comparison.
+ORB matches here are transient loop evidence. They are not maintained as
+landmark tracks, so there is no camera-plus-landmark bundle-adjustment problem.
 
-### 3.6 Covariance and uncertainty
+### 4.7 Map and covariance
 
-The demo maintains a 6x6 covariance ordered as translation XYZ followed by
-rotation XYZ. Every odometry step adds configurable process noise:
+Each frame cloud is voxel-downsampled and capped. The current scan is displayed
+every frame; map keyframes are cached and accumulated. After optimization the map
+is rebuilt, and at shutdown it can receive a final global voxel pass before being
+written to PLY.
+
+The covariance is deliberately pedagogical:
 
 ```text
 P[k] = P[k-1] + Q
+P_after_closure = loop_closure_shrink * P_before_closure
 ```
 
-At an accepted loop constraint, covariance is multiplied by
-`loop_closure_shrink`. The yellow ellipsoid is built from eigenvectors and
-eigenvalues of the top-left positional 3x3 block:
+The yellow rings visualize eigenvalue-derived radii from the positional 3x3
+block. This is not rigorous SE(3) propagation or a measurement covariance.
 
-```text
-radius[i] = ellipsoid_sigma * sqrt(eigenvalue[i])
-```
+## 5. Outputs and analysis
 
-This covariance is pedagogical rather than a statistically rigorous propagation
-through SE(3). Production systems use Jacobians, adjoint transforms, calibrated
-sensor noise, and measurement updates.
-
-## 4. Files and entry points
-
-| File | Purpose |
+| Output | Use |
 |---|---|
-| `slam_demo.py` | Data association, odometry worker, pose graph, map, covariance, GUI and telemetry |
-| `config.yaml` | All camera, noise, map, optimization and visualization parameters |
-| `download_dataset.py` | Idempotent download/extraction of TUM `freiburg1_xyz` |
-| `setup.sh` | Creates `.venv` and installs pinned dependency ranges |
-| `requirements.txt` | Python dependencies |
-| `telemetry.csv` | Per-frame timing, status, uncertainty and correction output |
-| `examples/python/pipelines/rgbd_odometry.py` | Original Open3D odometry example |
-| `examples/python/reconstruction_system/` | Original Open3D reconstruction/pose-graph examples |
+| `telemetry.csv` | Per-frame timings, odometry status, search selectivity, accepted-loop verification details, correction jump, and heuristic uncertainty |
+| `output/autonomous_map.ply` | Final displayed colored point map after optional output voxel downsampling |
+| `output/trajectories.npz` | XYZ arrays for noisy, local, optimized, and optional GT trajectories |
+| `output/pose_graph.json` | Open3D graph nodes and sequential/loop edges |
+| `output/run_summary.json` | Aggregate tracking, performance, loop, trajectory, map, and optional GT-accuracy KPIs |
 
-## 5. Main functions in `slam_demo.py`
+`telemetry.csv` is opened in write mode beside `slam_demo.py`; configured writers
+replace same-named outputs in `output/` when they run. The PLY is skipped if the
+accumulated map is empty, and an interrupted worker may not reach pose-graph
+serialization. The NPZ arrays are positions, not full poses. The GT array can be
+empty and has no frame-index sidecar.
 
-| Function | Responsibility |
-|---|---|
-| `load_records()` | Synchronizes RGB, depth and ground truth; establishes map origin |
-| `read_rgbd()` | Loads one image pair and converts raw TUM depth to meters |
-| `point_chunk()` | Back-projects and downsamples one RGB-D frame in camera coordinates |
-| `transform_points()` | Places a camera-frame scan into the fixed map frame |
-| `processing_loop()` | Worker thread: odometry, graph edges, covariance, map and telemetry |
-| `optimize_pose_graph()` | Runs Open3D global Levenberg-Marquardt optimization |
-| `perturbation()` | Adds the optional artificial drift shown in red |
-| `covariance_ellipsoid()` | Converts positional covariance into yellow 3D rings |
-| `make_frustum()` | Builds the current camera field-of-view wireframe |
-| `make_image_panel()` | Displays the exact RGB and depth input used by odometry |
-| `consume()` | Main/GUI thread: map, current scan, camera, paths and image panel |
-| `main()` | CLI/configuration, dataset selection, worker startup and shutdown |
+The README's `## KPIs` section is the authoritative metric reference. Key
+interpretation rules are:
 
-`FrameState` is the thread-safe snapshot passed from the odometry worker to the
-GUI. It contains all four poses/paths, map updates, current scan, covariance,
-images, status and timing values.
+- `processing_hz` and JSON compute throughput invert worker compute time; they
+  are not end-to-end sustained rates.
+- Effective throughput uses run wall time and therefore includes pacing, GUI,
+  pauses, and final map/trajectory serialization.
+- Loop comparison/candidate/check counts describe detector selectivity, not
+  loop precision or recall.
+- Autonomous acceptance rate and mean match/PnP/ICP quality summarize only loops
+  that passed every threshold; they do not characterize rejected candidates or
+  prove that accepted loops are correct.
+- ATE compares translations directly in the first-camera frame without fitting
+  an additional trajectory alignment.
+- Accuracy is omitted without GT. In autonomous mode GT never participates in
+  estimation; in GT-assisted mode optimized accuracy is inherently circular.
+- The CLI prints a high-value subset; `run_summary.json` has all aggregate fields,
+  while `telemetry.csv` retains individual frames and accepted-loop details.
 
 ## 6. Parameters worth changing
 
-### Dataset and camera
+| Stage | Settings | Tradeoff |
+|---|---|---|
+| Association/calibration | `association_max_dt_s`, `depth_scale`, intrinsics | Synchronization and metric geometry correctness |
+| Dense odometry | `frame_stride`, `depth_diff_max_m` | Speed versus inter-frame alignment robustness |
+| Map | `voxel_size_m`, `map_every_n_frames`, `points_per_keyframe` | Detail versus memory and compute |
+| ORB retrieval | `orb_features`, `ratio_test`, `min_matches`, `min_match_score` | Recall versus false appearance candidates |
+| Search policy | `min_frame_separation`, `cooldown_frames`, `max_candidates` | Redundancy/cost versus opportunity to close loops |
+| PnP | RANSAC and inlier settings | Geometric proposal robustness |
+| ICP | correspondence, fitness, RMSE, and correction limits | Geometric acceptance strictness |
+| Graph | pruning, correspondence scale, loop preference | Influence/retention of uncertain loop edges |
+| Output | `map_voxel_size_m` | Saved map size versus detail |
 
-| Parameter | Effect |
-|---|---|
-| `depth_scale` | Raw integer depth units per meter; TUM uses 5000 |
-| `depth_trunc_m` | Discards farther points; lower values reduce clutter and cost |
-| `association_max_dt_s` | Maximum RGB/depth/GT timestamp mismatch |
-| `fx`, `fy`, `cx`, `cy` | Camera intrinsics; wrong values bend/misalign the map |
-
-### Odometry and map
-
-| Parameter | Effect |
-|---|---|
-| `frame_stride` | Larger motion baseline and fewer frames; too large breaks odometry |
-| `depth_diff_max_m` | Maximum depth inconsistency accepted by dense odometry |
-| `voxel_size_m` | Smaller gives detail but increases memory/render cost |
-| `map_every_n_frames` | Keyframe spacing; larger creates a lighter, sparser map |
-| `points_per_keyframe` | Hard cap on points retained from each keyframe |
-
-The `visualization` section also exposes `frustum_scale`,
-`camera_marker_radius_m`, point size, and trajectory width when the camera or
-paths are difficult to see on a particular display.
-
-### Global optimization
-
-| Parameter | Effect |
-|---|---|
-| `loop_closure_every_n_frames` | `0` disables loops; smaller values correct more often |
-| `loop_information` | Confidence of synthetic loop constraints versus odometry |
-| `preference_loop_closure` | Open3D weighting preference for uncertain loop edges |
-| `edge_prune_threshold` | Removes weak/inconsistent uncertain edges |
-| `max_correspondence_distance_m` | Scale used by Open3D's graph optimization option |
-
-### Drift and covariance
-
-| Parameter | Effect |
-|---|---|
-| `translation_std_m_per_frame` | Artificial red-path translation drift |
-| `rotation_std_deg_per_frame` | Artificial red-path angular drift |
-| `process_*_std` | Yellow uncertainty growth per frame |
-| `loop_closure_shrink` | Covariance reduction after a loop constraint |
-| `ellipsoid_sigma` | Number of standard deviations displayed |
+The configuration has no schema validator. Invalid intervals, calibration, or
+thresholds may fail at runtime or silently produce poor geometry.
 
 ## 7. Recommended experiments
 
-1. Run `--no-loop-closure`. Compare orange local odometry against blue GT.
-2. Run the default. At frame 50, watch the complete green path and map adjust.
-3. Run `--loop-closure-every 20` to see several global corrections quickly.
-4. Set artificial noise values to zero. Red then follows raw orange odometry.
-5. Raise translation noise to `0.02`; note that global optimization fixes green,
-   not red, because red is a visualization-only simulated estimate.
-6. Compare `voxel_size_m: 0.02` and `0.10`; inspect map detail and `map_ms`.
-7. Increase `frame_stride`; observe when dense tracking begins to fail.
-8. Set `loop_information` low and high; compare correction size and path shape.
-9. Watch whether the cyan current scan overlays the fixed map after each change.
-10. Plot `telemetry.csv` columns to study latency and correction events.
+1. Run autonomous with and without `groundtruth.txt`. The estimated outputs should
+   remain RGB-D-only; only blue visualization and accuracy fields change.
+2. Compare autonomous and odometry-only map/path outputs on the same frames.
+3. Tighten `ratio_test` and watch appearance candidates fall relative to database
+   comparisons.
+4. Raise `min_pnp_inliers`, then tighten ICP thresholds, to distinguish proposal
+   rejection from registration rejection.
+5. Compare `frame_stride: 1`, `3`, and `6`; inspect tracking success and loop
+   opportunities rather than speed alone.
+6. Compare map and output voxel sizes using `map_ms`, saved points, and extent.
+7. Use GT-assisted only to demonstrate graph deformation; do not treat its
+   optimized GT error as an autonomous benchmark.
+8. Plot per-frame CSV latency and compare it with aggregate JSON percentiles.
 
-## 8. Important limitations
+## 8. Controls and practical limits
 
-- Loop candidates and transforms come from ground truth; place recognition is
-  not implemented.
-- No persistent landmarks means no classical bundle adjustment.
-- The map is a keyframe point-cloud union, not a TSDF or surfel map.
-- Dynamic objects, exposure changes and depth artifacts are not modeled.
-- Covariance is an intuitive process-noise visualization, not a calibrated EKF.
-- Processing is CPU-based and intentionally sequential inside the odometry
-  worker so stage latency remains easy to understand.
+`Space` pauses/resumes while retaining viewer interaction. Left drag orbits,
+`Ctrl`+left or middle drag pans, the wheel zooms, `R` resets, `H` shows Open3D
+help, and `Q`/`Esc` quits. Use `--no-viewer --no-realtime` in headless sessions.
+
+Long runs grow the graph, keyframe database, and map without eviction. CPU
+processing is sequential inside the worker. There is no dynamic-object removal,
+TSDF/surfel fusion, checkpoint resume, GPU selection, or automatic recovery after
+tracking loss. These omissions keep the implementation small enough to inspect.
