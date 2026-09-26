@@ -46,8 +46,24 @@ python slam_demo.py --loop-closure-every 20
 python slam_demo.py --no-viewer --no-realtime --max-frames 100
 ```
 
-Use the mouse to orbit and zoom in Open3D. Press `Q` or `Esc` in the RGB-D
-window to stop. `--no-image-window` keeps only the 3D viewer.
+### Viewer controls
+
+| Input | Action |
+|---|---|
+| Left mouse drag | Orbit; horizontal movement rotates, vertical movement tilts |
+| `Ctrl` + left mouse drag | Pan/translate the view without rotating |
+| Middle mouse drag | Pan/translate (alternative to `Ctrl` + left drag) |
+| Mouse wheel | Zoom in/out |
+| `R` | Reset the view to fit the map |
+| `H` | Print Open3D's built-in control help in the terminal |
+| `Space` | Pause/resume odometry and playback; map navigation remains active |
+| `Q` in RGB-D window | Quit |
+| `Esc` | Quit |
+
+`Space` works when either the 3D or RGB-D window has keyboard focus. While
+paused, the current frame, camera pose and map are frozen, but the GUI event loop
+continues, so orbit, pan, tilt and zoom still work. `--no-image-window` keeps
+only the 3D viewer.
 
 ## 3. Pipeline, step by step
 

@@ -33,9 +33,11 @@ For SSH/CI: `python slam_demo.py --no-viewer --max-frames 20 --no-realtime`.
 - Terminal and `telemetry.csv`: I/O, odometry, mapping, total latency, processing
   Hz, viewer Hz, publish-to-render latency, failures, and correction jumps.
 
-Drag/scroll in the 3D window to orbit/zoom. Press `Q` or `Esc` in the image
-window to stop. Use `--no-image-window` for 3D only or `--no-viewer` for fully
-headless execution.
+3D controls: left-drag to orbit/tilt; `Ctrl`+left-drag or middle-drag to pan;
+mouse wheel to zoom; `R` to reset the view; `H` for Open3D's built-in help.
+Press `Space` in either window to pause/resume computation while the map remains
+interactive. Press `Q` in the image window or `Esc` to quit. Use
+`--no-image-window` for 3D only or `--no-viewer` for fully headless execution.
 
 Every 50 processed frames, a synthetic GT loop constraint triggers Open3D
 Levenberg-Marquardt pose-graph optimization. It corrects the complete green path

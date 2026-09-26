@@ -181,7 +181,7 @@ def optimize_pose_graph(pose_graph, config):
         o3d.pipelines.registration.GlobalOptimizationConvergenceCriteria(), option)
 
 
-def processing_loop(records, config, output, stop, seed):
+def processing_loop(records, config, output, stop, pause, seed):
     """Run RGB-D odometry in a worker and publish immutable viewer updates."""
     try:
         rng = np.random.default_rng(seed)
@@ -207,6 +207,8 @@ def processing_loop(records, config, output, stop, seed):
             writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
             writer.writeheader()
             for index, record in enumerate(records):
+                while pause.is_set() and not stop.is_set():
+                    time.sleep(0.02)
                 if stop.is_set():
                     break
                 started = time.perf_counter()
@@ -353,7 +355,7 @@ def print_telemetry(state, end_to_end_ms, viewer_hz):
           f"viewer {viewer_hz:5.1f} Hz | jump {state.correction_jump_m:.3f} m", end="", flush=True)
 
 
-def make_image_panel(state, config):
+def make_image_panel(state, config, paused=False):
     """Show the exact RGB and metric depth pair used by dense odometry."""
     color = cv2.cvtColor(state.color_frame, cv2.COLOR_RGB2BGR)
     depth_limit = config["dataset"]["depth_trunc_m"]
@@ -363,6 +365,8 @@ def make_image_panel(state, config):
     font = cv2.FONT_HERSHEY_SIMPLEX
     cv2.putText(color, "RGB frame used by odometry", (15, 30), font, 0.7,
                 (40, 255, 40), 2, cv2.LINE_AA)
+    cv2.putText(color, "SPACE pause/resume | Q or Esc quit", (15, 60), font,
+                0.55, (255, 255, 255), 1, cv2.LINE_AA)
     cv2.putText(depth_color, f"Depth: 0-{depth_limit:.1f} m (dense pixels)",
                 (15, 30), font, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
     status = "LOOP CLOSURE" if state.closure else (
@@ -376,10 +380,17 @@ def make_image_panel(state, config):
                   (panel.shape[1], panel.shape[0]), (0, 0, 0), -1)
     cv2.putText(panel, caption, (15, panel.shape[0] - 12), font, 0.65,
                 (255, 255, 255), 2, cv2.LINE_AA)
+    if paused:
+        cv2.rectangle(panel, (panel.shape[1] // 2 - 145, 190),
+                      (panel.shape[1] // 2 + 145, 285), (0, 0, 0), -1)
+        cv2.putText(panel, "PAUSED", (panel.shape[1] // 2 - 105, 240), font,
+                    1.5, (0, 255, 255), 3, cv2.LINE_AA)
+        cv2.putText(panel, "SPACE to resume", (panel.shape[1] // 2 - 105, 270),
+                    font, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
     return panel
 
 
-def consume(output, stop, config, intrinsic, viewer, show_images, realtime):
+def consume(output, stop, pause, config, intrinsic, viewer, show_images, realtime):
     """Consume worker states either headlessly or in Open3D's main-thread GUI."""
     visualizer = None
     map_geometry = o3d.geometry.PointCloud()
@@ -391,11 +402,35 @@ def consume(output, stop, config, intrinsic, viewer, show_images, realtime):
     last_view = time.perf_counter()
     wall_start = None
     view_fitted = False
+    state = None
+    pause_started = None
+
+    def toggle_pause(_visualizer=None):
+        """Pause computation/playback while leaving both GUI event loops active."""
+        nonlocal pause_started, wall_start
+        now = time.perf_counter()
+        if pause.is_set():
+            pause.clear()
+            if wall_start is not None and pause_started is not None:
+                wall_start += now - pause_started
+            pause_started = None
+            print("\nRESUMED | Space: pause", flush=True)
+        else:
+            pause.set()
+            pause_started = now
+            print("\nPAUSED | 3D controls remain active | Space: resume", flush=True)
+        return False
+
+    def request_exit(_visualizer=None):
+        stop.set()
+        return False
 
     if viewer:
-        visualizer = o3d.visualization.Visualizer()
+        visualizer = o3d.visualization.VisualizerWithKeyCallback()
+        visualizer.register_key_callback(32, toggle_pause)  # GLFW space.
+        visualizer.register_key_callback(256, request_exit)  # GLFW escape.
         size = config["visualization"]
-        if not visualizer.create_window("RGB-D SLAM | magenta=camera cyan=current scan green=optimized",
+        if not visualizer.create_window("RGB-D SLAM | SPACE pause | H controls | R reset view",
                                         size["window_width"], size["window_height"]):
             stop.set()
             raise RuntimeError("Open3D could not create a window; use --no-viewer over SSH/headless")
@@ -427,9 +462,34 @@ def consume(output, stop, config, intrinsic, viewer, show_images, realtime):
         camera_center = np.zeros(3)
         visualizer.get_render_option().point_size = size["point_size"]
         visualizer.get_render_option().line_width = size["trajectory_width"]
+        print("3D controls | left-drag: orbit/tilt | Ctrl+left-drag or middle-drag: pan | "
+              "wheel: zoom | R: reset | H: Open3D help | Space: pause", flush=True)
 
-    while True:
-        item = output.get()
+    while not stop.is_set():
+        if visualizer:
+            if not visualizer.poll_events():
+                stop.set()
+                break
+            visualizer.update_renderer()
+
+        if show_images and state is not None:
+            cv2.imshow("TUM RGB-D input | Space: pause | Q or Esc: quit",
+                       make_image_panel(state, config, pause.is_set()))
+        key = cv2.waitKey(10) & 0xFF if show_images else -1
+        if key == ord(" "):
+            toggle_pause()
+        elif key in (ord("q"), 27):
+            stop.set()
+            break
+
+        if pause.is_set():
+            time.sleep(0.01)
+            continue
+
+        try:
+            item = output.get(timeout=0.02)
+        except queue.Empty:
+            continue
         received = time.perf_counter()
         if item is None:
             break
@@ -456,12 +516,6 @@ def consume(output, stop, config, intrinsic, viewer, show_images, realtime):
         end_to_end_ms = max(0.0, (now - state.produced_at) * 1000.0)
         print_telemetry(state, end_to_end_ms, viewer_hz)
         last_view = now
-
-        if show_images:
-            cv2.imshow("TUM RGB-D input | Q or Esc: quit", make_image_panel(state, config))
-            if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
-                stop.set()
-                break
 
         if visualizer:
             map_geometry.points = o3d.utility.Vector3dVector(map_points)
@@ -490,11 +544,6 @@ def consume(output, stop, config, intrinsic, viewer, show_images, realtime):
             if not view_fitted and len(map_points):
                 visualizer.reset_view_point(True)
                 view_fitted = True
-            if not visualizer.poll_events():
-                stop.set()
-                break
-            visualizer.update_renderer()
-
     print("\nTelemetry saved to telemetry.csv")
     if visualizer:
         visualizer.destroy_window()
@@ -537,11 +586,12 @@ def main() -> None:
 
     output: queue.Queue = queue.Queue(maxsize=2)
     stop = threading.Event()
+    pause = threading.Event()
     worker = threading.Thread(target=processing_loop, name="rgbd-odometry",
-                              args=(records, config, output, stop, args.seed), daemon=True)
+                              args=(records, config, output, stop, pause, args.seed), daemon=True)
     worker.start()
     try:
-        consume(output, stop, config, make_intrinsic(config), not args.no_viewer,
+        consume(output, stop, pause, config, make_intrinsic(config), not args.no_viewer,
                 not args.no_viewer and not args.no_image_window, not args.no_realtime)
     finally:
         stop.set()
