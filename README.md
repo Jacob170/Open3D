@@ -521,6 +521,10 @@ serialization.
 ## Troubleshooting
 
 Use `--no-viewer --no-realtime` over SSH or without a working OpenGL display.
+On a Wayland desktop with XWayland available, the launcher automatically selects
+the X11 compatibility backend because Open3D's legacy GLFW viewer can fail GLEW
+initialization on native Wayland. `--no-image-window` disables only the RGB-D
+OpenCV window; use `--no-viewer` to disable both GUI windows.
 Reduce `frame_stride` if odometry fails. Verify calibration and `depth_scale` if
 the map bends or has the wrong scale. Increase voxel sizes, keyframe spacing, or
 reduce `points_per_keyframe` if mapping/rendering is slow. Autonomous runs with

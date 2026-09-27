@@ -13,6 +13,7 @@ import bisect
 import csv
 import json
 import math
+import os
 import queue
 import threading
 import time
@@ -443,6 +444,14 @@ def print_telemetry(state, end_to_end_ms, viewer_hz):
           f"({state.timings_ms['hz']:5.1f} Hz) | odom {state.timings_ms['odometry']:6.1f} ms | "
           f"map {state.timings_ms['map']:5.1f} ms | e2e {end_to_end_ms:5.1f} ms | "
           f"viewer {viewer_hz:5.1f} Hz | jump {state.correction_jump_m:.3f} m", end="", flush=True)
+
+
+def configure_window_backend(viewer):
+    """Use XWayland when Open3D's legacy GLFW viewer cannot initialize on Wayland."""
+    if (viewer and os.environ.get("XDG_SESSION_TYPE") == "wayland" and
+            os.environ.get("DISPLAY")):
+        os.environ["XDG_SESSION_TYPE"] = "x11"
+        print("Open3D viewer: using XWayland compatibility backend")
 
 
 def make_image_panel(state, config, paused=False):
@@ -929,6 +938,7 @@ def main() -> None:
     pause = threading.Event()
     worker = threading.Thread(target=processing_loop, name="rgbd-odometry",
                               args=(records, config, output, stop, pause, args.seed), daemon=True)
+    configure_window_backend(not args.no_viewer)
     worker.start()
     try:
         consume(output, stop, pause, config, make_intrinsic(config), not args.no_viewer,
